@@ -3,7 +3,7 @@ const GOOGLE_API_KEY = Deno.env.get("GOOGLE_API_KEY") || "";
 const IMAGE_MODEL =
   Deno.env.get("IMAGE_MODEL") || "gemini-3.1-flash-image-preview";
 const TRANSLATION_MODEL =
-  Deno.env.get("TRANSLATION_MODEL") || "gemini-2.0-flash";
+  Deno.env.get("TRANSLATION_MODEL") || "gemini-2.5-flash";
 const DEFAULT_TRANSLATION_TIMEOUT_MS = 20000;
 const DEFAULT_IMAGE_TIMEOUT_MS = 120000;
 const MIN_IMAGE_TIMEOUT_MS = 120000;
