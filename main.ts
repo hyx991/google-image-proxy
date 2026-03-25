@@ -86,6 +86,24 @@ function extractInlineImage(body: any) {
   return null;
 }
 
+function encodeMetadataHeader(metadata: Record<string, unknown>) {
+  return encodeURIComponent(JSON.stringify(metadata));
+}
+
+function binaryImageResponse(inlineData: { data: string; mimeType?: string }, metadata: Record<string, unknown>) {
+  const mimeType = inlineData.mimeType || "image/jpeg";
+  const bytes = Uint8Array.from(atob(inlineData.data), (char) => char.charCodeAt(0));
+  return new Response(bytes, {
+    status: 200,
+    headers: {
+      "Content-Type": mimeType,
+      "Cache-Control": "no-store",
+      "X-Proxy-Metadata": encodeMetadataHeader(metadata),
+      ...CORS_HEADERS,
+    },
+  });
+}
+
 async function callGoogleModel(model: string, payload: unknown, timeoutMs: number) {
   const url =
     `${API_BASE}/${encodeURIComponent(model)}:generateContent?key=${
@@ -247,7 +265,7 @@ Deno.serve(async (req) => {
     return jsonResponse({
       success: true,
       service: "google-image-proxy",
-      paths: ["/", "/proxy", "/generate-image"],
+      paths: ["/", "/proxy", "/generate-image", "/generate-image-binary"],
       hasApiKey: true,
       imageModel: IMAGE_MODEL,
       translationModel: TRANSLATION_MODEL,
@@ -257,7 +275,10 @@ Deno.serve(async (req) => {
     });
   }
 
-  if (req.method !== "POST" || !["/", "/proxy", "/generate-image"].includes(url.pathname)) {
+  if (
+    req.method !== "POST" ||
+    !["/", "/proxy", "/generate-image", "/generate-image-binary"].includes(url.pathname)
+  ) {
     return jsonResponse({ success: false, error: "not_found", message: "Not found" }, 404);
   }
 
@@ -403,6 +424,10 @@ Deno.serve(async (req) => {
       },
       422,
     );
+  }
+
+  if (url.pathname === "/generate-image-binary") {
+    return binaryImageResponse(inlineData, metadata);
   }
 
   return jsonResponse({
