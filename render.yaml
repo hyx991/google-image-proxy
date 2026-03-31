@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: ffmpeg-clip-api
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /
+    dockerContext: .
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MAX_INPUT_BYTES
+        value: "125829120"
+      - key: MAX_CLIP_SECONDS
+        value: "600"
+      - key: FETCH_TIMEOUT_MS
+        value: "120000"
