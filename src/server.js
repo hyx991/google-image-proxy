@@ -384,9 +384,9 @@ async function fetchImageInlineData(imageUrl) {
 function normalizeRequestedVideoDuration(duration) {
   const parsed = Number(duration);
   if (!Number.isFinite(parsed) || parsed <= 0) {
-    return undefined;
+    return 4;
   }
-  return Math.round(parsed);
+  return parsed <= 4 ? 4 : 8;
 }
 
 async function pollGoogleOperation(operationName, apiKey) {
