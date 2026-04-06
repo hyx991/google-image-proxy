@@ -6,17 +6,98 @@ import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 const PORT = Number(process.env.PORT || 10000);
 const MAX_INPUT_BYTES = Number(process.env.MAX_INPUT_BYTES || 120 * 1024 * 1024);
 const MAX_CLIP_SECONDS = Number(process.env.MAX_CLIP_SECONDS || 600);
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 120000);
+const GOOGLE_API_BASE = "https://generativelanguage.googleapis.com/v1beta";
+const DEFAULT_IMAGE_MODEL =
+  process.env.IMAGE_MODEL || "gemini-3.1-flash-image-preview";
+const DEFAULT_VIDEO_MODEL =
+  process.env.VIDEO_MODEL || "veo-3.1-generate-preview";
+const DEFAULT_TRANSLATION_MODEL =
+  process.env.TRANSLATION_MODEL || "gemini-2.5-flash";
+const GOOGLE_IMAGE_TIMEOUT_MS = Number(process.env.GOOGLE_IMAGE_TIMEOUT_MS || 180000);
+const GOOGLE_VIDEO_TIMEOUT_MS = Number(process.env.GOOGLE_VIDEO_TIMEOUT_MS || 900000);
+const GOOGLE_POLL_MS = Number(process.env.GOOGLE_POLL_MS || 10000);
+const RELAY_AUTH_TOKEN = String(process.env.RELAY_AUTH_TOKEN || "").trim();
+const CJK_RE =
+  /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\u31f0-\u31ff\uac00-\ud7af]/u;
 
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,X-Goog-Api-Key");
+}
+
+function json(res, status, payload) {
+  setCors(res);
+  res.status(status).json(payload);
+}
+
+function encodeMetadataHeader(metadata) {
+  return encodeURIComponent(JSON.stringify(metadata));
+}
+
+function truncate(value, max = 1200) {
+  const input = String(value ?? "");
+  if (input.length <= max) {
+    return input;
+  }
+  return `${input.slice(0, max)}...<truncated>`;
+}
+
+function normalizeImageModel(model) {
+  if (!model) {
+    return DEFAULT_IMAGE_MODEL;
+  }
+  if (model === "BANNER_2") {
+    return "gemini-3.1-flash-image-preview";
+  }
+  return model;
+}
+
+function normalizeVideoModel(model) {
+  if (!model) {
+    return DEFAULT_VIDEO_MODEL;
+  }
+  if (model === "veo-3.0") {
+    return "veo-3.1-generate-preview";
+  }
+  return model;
+}
+
+function resolveGoogleApiKey(req) {
+  return String(
+    req.get("x-goog-api-key") ||
+      req.get("x-google-api-key") ||
+      process.env.GOOGLE_API_KEY ||
+      "",
+  ).trim();
+}
+
+function ensureRelayAuthorized(req, res) {
+  if (!RELAY_AUTH_TOKEN) {
+    return true;
+  }
+
+  const authorization = String(req.get("authorization") || "");
+  const token = authorization.startsWith("Bearer ")
+    ? authorization.slice("Bearer ".length).trim()
+    : "";
+
+  if (token !== RELAY_AUTH_TOKEN) {
+    json(res, 401, {
+      success: false,
+      error: "unauthorized",
+      message: "Missing or invalid relay bearer token",
+    });
+    return false;
+  }
+
+  return true;
 }
 
 function parseClipParams(req) {
@@ -27,7 +108,7 @@ function parseClipParams(req) {
   return { videoUrl, start, end };
 }
 
-function validateParams({ videoUrl, start, end }) {
+function validateClipParams({ videoUrl, start, end }) {
   if (!videoUrl || !/^https?:\/\//i.test(videoUrl)) {
     return "video_url must be an http/https URL";
   }
@@ -100,7 +181,7 @@ async function clipVideo({ inputFile, outputFile, start, end }) {
       "copy",
       "-c:a",
       "copy",
-      outputFile
+      outputFile,
     ]);
     return "copy";
   } catch {
@@ -124,10 +205,223 @@ async function clipVideo({ inputFile, outputFile, start, end }) {
       "128k",
       "-movflags",
       "+faststart",
-      outputFile
+      outputFile,
     ]);
     return "reencode";
   }
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+    return response;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function callGoogleJson(url, { apiKey, method = "GET", body, timeoutMs }) {
+  try {
+    const response = await fetchWithTimeout(
+      url,
+      {
+        method,
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "x-goog-api-key": apiKey,
+        },
+        body: body ? JSON.stringify(body) : undefined,
+      },
+      timeoutMs,
+    );
+
+    const text = await response.text();
+    let payload = null;
+    if (text) {
+      try {
+        payload = JSON.parse(text);
+      } catch {
+        payload = null;
+      }
+    }
+
+    return {
+      ok: response.ok,
+      status: response.status,
+      text,
+      payload,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const isTimeout = message === "timeout" || message.includes("aborted");
+    return {
+      ok: false,
+      status: 0,
+      text: message,
+      payload: null,
+      networkError: isTimeout ? "timeout" : "network_error",
+    };
+  }
+}
+
+function extractInlineImage(payload) {
+  const candidates = Array.isArray(payload?.candidates) ? payload.candidates : [];
+  for (const candidate of candidates) {
+    const parts = Array.isArray(candidate?.content?.parts)
+      ? candidate.content.parts
+      : [];
+    for (const part of parts) {
+      if (part?.inlineData?.data) {
+        return {
+          data: part.inlineData.data,
+          mimeType: part.inlineData.mimeType || "image/png",
+        };
+      }
+    }
+  }
+  return null;
+}
+
+function extractTextParts(payload) {
+  const candidates = Array.isArray(payload?.candidates) ? payload.candidates : [];
+  const texts = [];
+  for (const candidate of candidates) {
+    const parts = Array.isArray(candidate?.content?.parts)
+      ? candidate.content.parts
+      : [];
+    for (const part of parts) {
+      if (typeof part?.text === "string" && part.text.trim()) {
+        texts.push(part.text.trim());
+      }
+    }
+  }
+  return texts;
+}
+
+async function maybeRewritePrompt(prompt, apiKey) {
+  if (!CJK_RE.test(prompt)) {
+    return {
+      originalPrompt: prompt,
+      effectivePrompt: prompt,
+      translationApplied: false,
+      translationMode: "none",
+    };
+  }
+
+  const rewriteInstruction = [
+    "Rewrite the following image prompt into concise natural English for an image generation model.",
+    "Preserve all visual details and intent.",
+    "Return only the rewritten English prompt.",
+    "",
+    `User prompt: ${prompt}`,
+  ].join("\n");
+
+  const translationPayload = {
+    contents: [{ parts: [{ text: rewriteInstruction }] }],
+    generationConfig: {
+      temperature: 0.2,
+      topP: 0.8,
+      maxOutputTokens: 120,
+    },
+  };
+
+  const translation = await callGoogleJson(
+    `${GOOGLE_API_BASE}/models/${encodeURIComponent(DEFAULT_TRANSLATION_MODEL)}:generateContent`,
+    {
+      apiKey,
+      method: "POST",
+      body: translationPayload,
+      timeoutMs: FETCH_TIMEOUT_MS,
+    },
+  );
+
+  if (!translation.ok) {
+    return {
+      error: translation.networkError || "translation_http_error",
+      message: translation.networkError
+        ? `Prompt rewrite failed: ${translation.text}`
+        : `Prompt rewrite upstream ${translation.status}`,
+    };
+  }
+
+  const translatedText = extractTextParts(translation.payload).join("\n").trim();
+  if (!translatedText) {
+    return {
+      error: "translation_empty",
+      message: "Prompt rewrite upstream returned no text",
+    };
+  }
+
+  return {
+    originalPrompt: prompt,
+    effectivePrompt: translatedText,
+    translationApplied: true,
+    translationMode: "proxy-rewrite",
+  };
+}
+
+async function fetchImageInlineData(imageUrl) {
+  const response = await fetchWithTimeout(imageUrl, {}, FETCH_TIMEOUT_MS);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch source image: ${response.status} ${response.statusText}`);
+  }
+
+  const mimeType = response.headers.get("content-type") || "image/png";
+  const bytes = Buffer.from(await response.arrayBuffer());
+
+  return {
+    mimeType,
+    data: bytes.toString("base64"),
+  };
+}
+
+async function pollGoogleOperation(operationName, apiKey) {
+  const deadline = Date.now() + GOOGLE_VIDEO_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    const poll = await callGoogleJson(
+      `${GOOGLE_API_BASE}/${operationName}`,
+      {
+        apiKey,
+        method: "GET",
+        timeoutMs: FETCH_TIMEOUT_MS,
+      },
+    );
+
+    if (!poll.ok) {
+      throw new Error(
+        poll.networkError
+          ? `Failed to poll Google operation: ${poll.text}`
+          : `Failed to poll Google operation: ${poll.status} ${truncate(poll.text)}`,
+      );
+    }
+
+    if (poll.payload?.error?.message) {
+      throw new Error(poll.payload.error.message);
+    }
+
+    if (poll.payload?.done) {
+      return poll.payload;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, GOOGLE_POLL_MS));
+  }
+
+  throw new Error("Google video generation timed out.");
+}
+
+function extractGeneratedVideoUri(operationPayload) {
+  return (
+    operationPayload?.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri ||
+    operationPayload?.response?.generatedSamples?.[0]?.video?.uri ||
+    operationPayload?.response?.videos?.[0]?.uri ||
+    null
+  );
 }
 
 app.options("*", (req, res) => {
@@ -136,12 +430,554 @@ app.options("*", (req, res) => {
 });
 
 app.get("/", (req, res) => {
-  setCors(res);
-  res.json({
+  json(res, 200, {
     ok: true,
     service: "render-ffmpeg-clip-api",
-    usage: "/clip?video_url=...&start=0&end=5"
+    routes: [
+      "/",
+      "/health",
+      "/clip",
+      "/google/models",
+      "/google/image",
+      "/google/image-binary",
+      "/google/video",
+      "/google/video-binary",
+    ],
+    hasGoogleApiKeyEnv: Boolean(process.env.GOOGLE_API_KEY),
+    relayTokenRequired: Boolean(RELAY_AUTH_TOKEN),
   });
+});
+
+app.get("/health", (req, res) => {
+  json(res, 200, {
+    ok: true,
+    service: "render-ffmpeg-clip-api",
+    uptimeSeconds: Math.round(process.uptime()),
+  });
+});
+
+app.get("/google/models", async (req, res) => {
+  if (!ensureRelayAuthorized(req, res)) {
+    return;
+  }
+
+  const apiKey = resolveGoogleApiKey(req);
+  if (!apiKey) {
+    return json(res, 400, {
+      success: false,
+      error: "missing_google_api_key",
+      message: "Provide x-goog-api-key or configure GOOGLE_API_KEY",
+    });
+  }
+
+  const response = await callGoogleJson(
+    `${GOOGLE_API_BASE}/models`,
+    {
+      apiKey,
+      method: "GET",
+      timeoutMs: FETCH_TIMEOUT_MS,
+    },
+  );
+
+  if (!response.ok) {
+    return json(res, response.networkError === "timeout" ? 504 : 502, {
+      success: false,
+      error: response.networkError || "google_models_failed",
+      message: response.networkError ? response.text : `Google models ${response.status}`,
+      debug: {
+        upstreamStatus: response.status,
+        upstreamBody: truncate(response.text),
+      },
+    });
+  }
+
+  return json(res, 200, response.payload || {});
+});
+
+app.post("/google/image", async (req, res) => {
+  if (!ensureRelayAuthorized(req, res)) {
+    return;
+  }
+
+  const apiKey = resolveGoogleApiKey(req);
+  if (!apiKey) {
+    return json(res, 400, {
+      success: false,
+      error: "missing_google_api_key",
+      message: "Provide x-goog-api-key or configure GOOGLE_API_KEY",
+    });
+  }
+
+  const prompt = String(req.body?.prompt || "").trim();
+  const model = normalizeImageModel(String(req.body?.model || "").trim());
+  const aspectRatio = String(req.body?.aspectRatio || "16:9").trim() || "16:9";
+
+  if (!prompt) {
+    return json(res, 400, {
+      success: false,
+      error: "missing_prompt",
+      message: "Missing prompt",
+    });
+  }
+
+  const promptInfo = await maybeRewritePrompt(prompt, apiKey);
+  if ("error" in promptInfo) {
+    return json(res, 502, {
+      success: false,
+      error: promptInfo.error,
+      message: promptInfo.message,
+    });
+  }
+
+  const response = await callGoogleJson(
+    `${GOOGLE_API_BASE}/models/${encodeURIComponent(model)}:generateContent`,
+    {
+      apiKey,
+      method: "POST",
+      timeoutMs: GOOGLE_IMAGE_TIMEOUT_MS,
+      body: {
+        contents: [{ parts: [{ text: promptInfo.effectivePrompt }] }],
+        generationConfig: {
+          responseModalities: ["TEXT", "IMAGE"],
+          imageConfig: {
+            aspectRatio,
+          },
+        },
+      },
+    },
+  );
+
+  const metadata = {
+    provider: "google",
+    model,
+    originalPrompt: promptInfo.originalPrompt,
+    effectivePrompt: promptInfo.effectivePrompt,
+    translationApplied: promptInfo.translationApplied,
+    translationMode: promptInfo.translationMode,
+    relayMode: "render",
+  };
+
+  if (!response.ok) {
+    return json(res, response.networkError === "timeout" ? 504 : 502, {
+      success: false,
+      error: response.networkError || "google_image_failed",
+      message: response.networkError
+        ? response.text
+        : `Google image generation failed: ${response.status}`,
+      metadata,
+      debug: {
+        upstreamStatus: response.status,
+        upstreamBody: truncate(response.text),
+      },
+    });
+  }
+
+  const inlineData = extractInlineImage(response.payload);
+  if (!inlineData?.data) {
+    return json(res, 422, {
+      success: false,
+      error: "no_inline_image",
+      message: "Google image generation returned no image data",
+      metadata,
+      debug: {
+        upstreamBody: truncate(response.text),
+        upstreamTextParts: extractTextParts(response.payload).slice(0, 3),
+      },
+    });
+  }
+
+  return json(res, 200, {
+    success: true,
+    provider: "google",
+    model,
+    mimeType: inlineData.mimeType,
+    data: inlineData.data,
+    metadata,
+  });
+});
+
+app.post("/google/image-binary", async (req, res) => {
+  if (!ensureRelayAuthorized(req, res)) {
+    return;
+  }
+
+  const apiKey = resolveGoogleApiKey(req);
+  if (!apiKey) {
+    return json(res, 400, {
+      success: false,
+      error: "missing_google_api_key",
+      message: "Provide x-goog-api-key or configure GOOGLE_API_KEY",
+    });
+  }
+
+  const prompt = String(req.body?.prompt || "").trim();
+  const model = normalizeImageModel(String(req.body?.model || "").trim());
+  const aspectRatio = String(req.body?.aspectRatio || "16:9").trim() || "16:9";
+
+  if (!prompt) {
+    return json(res, 400, {
+      success: false,
+      error: "missing_prompt",
+      message: "Missing prompt",
+    });
+  }
+
+  const promptInfo = await maybeRewritePrompt(prompt, apiKey);
+  if ("error" in promptInfo) {
+    return json(res, 502, {
+      success: false,
+      error: promptInfo.error,
+      message: promptInfo.message,
+    });
+  }
+
+  const response = await callGoogleJson(
+    `${GOOGLE_API_BASE}/models/${encodeURIComponent(model)}:generateContent`,
+    {
+      apiKey,
+      method: "POST",
+      timeoutMs: GOOGLE_IMAGE_TIMEOUT_MS,
+      body: {
+        contents: [{ parts: [{ text: promptInfo.effectivePrompt }] }],
+        generationConfig: {
+          responseModalities: ["TEXT", "IMAGE"],
+          imageConfig: {
+            aspectRatio,
+          },
+        },
+      },
+    },
+  );
+
+  const metadata = {
+    provider: "google",
+    model,
+    originalPrompt: promptInfo.originalPrompt,
+    effectivePrompt: promptInfo.effectivePrompt,
+    translationApplied: promptInfo.translationApplied,
+    translationMode: promptInfo.translationMode,
+    relayMode: "render",
+  };
+
+  if (!response.ok) {
+    return json(res, response.networkError === "timeout" ? 504 : 502, {
+      success: false,
+      error: response.networkError || "google_image_failed",
+      message: response.networkError
+        ? response.text
+        : `Google image generation failed: ${response.status}`,
+      metadata,
+      debug: {
+        upstreamStatus: response.status,
+        upstreamBody: truncate(response.text),
+      },
+    });
+  }
+
+  const inlineData = extractInlineImage(response.payload);
+  if (!inlineData?.data) {
+    return json(res, 422, {
+      success: false,
+      error: "no_inline_image",
+      message: "Google image generation returned no image data",
+      metadata,
+      debug: {
+        upstreamBody: truncate(response.text),
+        upstreamTextParts: extractTextParts(response.payload).slice(0, 3),
+      },
+    });
+  }
+
+  const bytes = Buffer.from(inlineData.data, "base64");
+  setCors(res);
+  res.setHeader("Content-Type", inlineData.mimeType || "image/png");
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("X-Proxy-Metadata", encodeMetadataHeader(metadata));
+  return res.status(200).send(bytes);
+});
+
+app.post("/google/video", async (req, res) => {
+  if (!ensureRelayAuthorized(req, res)) {
+    return;
+  }
+
+  const apiKey = resolveGoogleApiKey(req);
+  if (!apiKey) {
+    return json(res, 400, {
+      success: false,
+      error: "missing_google_api_key",
+      message: "Provide x-goog-api-key or configure GOOGLE_API_KEY",
+    });
+  }
+
+  const prompt = String(req.body?.prompt || "").trim();
+  const imageUrl = String(req.body?.imageUrl || "").trim();
+  const model = normalizeVideoModel(String(req.body?.model || "").trim());
+  const duration = req.body?.duration ?? null;
+
+  if (!prompt) {
+    return json(res, 400, {
+      success: false,
+      error: "missing_prompt",
+      message: "Missing prompt",
+    });
+  }
+
+  if (!imageUrl) {
+    return json(res, 400, {
+      success: false,
+      error: "missing_image_url",
+      message: "Missing imageUrl",
+    });
+  }
+
+  try {
+    const imageInput = await fetchImageInlineData(imageUrl);
+    const create = await callGoogleJson(
+      `${GOOGLE_API_BASE}/models/${encodeURIComponent(model)}:predictLongRunning`,
+      {
+        apiKey,
+        method: "POST",
+        timeoutMs: FETCH_TIMEOUT_MS,
+        body: {
+          instances: [
+            {
+              prompt,
+              image: {
+                inlineData: imageInput,
+              },
+            },
+          ],
+          parameters: {
+            aspectRatio: "16:9",
+          },
+        },
+      },
+    );
+
+    if (!create.ok) {
+      return json(res, create.networkError === "timeout" ? 504 : 502, {
+        success: false,
+        error: create.networkError || "google_video_create_failed",
+        message: create.networkError
+          ? create.text
+          : `Google video generation failed: ${create.status}`,
+        debug: {
+          upstreamStatus: create.status,
+          upstreamBody: truncate(create.text),
+        },
+      });
+    }
+
+    const operationName = create.payload?.name;
+    if (!operationName) {
+      return json(res, 502, {
+        success: false,
+        error: "missing_operation_name",
+        message: "Google video generation returned no operation name",
+        debug: {
+          upstreamBody: truncate(create.text),
+        },
+      });
+    }
+
+    const completedOperation = await pollGoogleOperation(operationName, apiKey);
+    const videoUri = extractGeneratedVideoUri(completedOperation);
+
+    if (!videoUri) {
+      return json(res, 502, {
+        success: false,
+        error: "missing_video_uri",
+        message: "Google video generation completed without a video URI",
+        debug: {
+          operationName,
+          operationPayload: completedOperation,
+        },
+      });
+    }
+
+    const videoResponse = await fetchWithTimeout(
+      videoUri,
+      {
+        headers: {
+          "x-goog-api-key": apiKey,
+        },
+      },
+      FETCH_TIMEOUT_MS,
+    );
+
+    if (!videoResponse.ok) {
+      return json(res, 502, {
+        success: false,
+        error: "video_download_failed",
+        message: `Failed to download generated video: ${videoResponse.status}`,
+      });
+    }
+
+    const videoBytes = Buffer.from(await videoResponse.arrayBuffer());
+
+    return json(res, 200, {
+      success: true,
+      provider: "google",
+      model,
+      mimeType: "video/mp4",
+      data: videoBytes.toString("base64"),
+      metadata: {
+        provider: "google",
+        model,
+        relayMode: "render",
+        operationName,
+        requestedDuration: duration,
+      },
+    });
+  } catch (error) {
+    return json(res, 502, {
+      success: false,
+      error: "google_video_failed",
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+app.post("/google/video-binary", async (req, res) => {
+  if (!ensureRelayAuthorized(req, res)) {
+    return;
+  }
+
+  const apiKey = resolveGoogleApiKey(req);
+  if (!apiKey) {
+    return json(res, 400, {
+      success: false,
+      error: "missing_google_api_key",
+      message: "Provide x-goog-api-key or configure GOOGLE_API_KEY",
+    });
+  }
+
+  const prompt = String(req.body?.prompt || "").trim();
+  const imageUrl = String(req.body?.imageUrl || "").trim();
+  const model = normalizeVideoModel(String(req.body?.model || "").trim());
+  const duration = req.body?.duration ?? null;
+
+  if (!prompt) {
+    return json(res, 400, {
+      success: false,
+      error: "missing_prompt",
+      message: "Missing prompt",
+    });
+  }
+
+  if (!imageUrl) {
+    return json(res, 400, {
+      success: false,
+      error: "missing_image_url",
+      message: "Missing imageUrl",
+    });
+  }
+
+  try {
+    const imageInput = await fetchImageInlineData(imageUrl);
+    const create = await callGoogleJson(
+      `${GOOGLE_API_BASE}/models/${encodeURIComponent(model)}:predictLongRunning`,
+      {
+        apiKey,
+        method: "POST",
+        timeoutMs: FETCH_TIMEOUT_MS,
+        body: {
+          instances: [
+            {
+              prompt,
+              image: {
+                inlineData: imageInput,
+              },
+            },
+          ],
+          parameters: {
+            aspectRatio: "16:9",
+          },
+        },
+      },
+    );
+
+    if (!create.ok) {
+      return json(res, create.networkError === "timeout" ? 504 : 502, {
+        success: false,
+        error: create.networkError || "google_video_create_failed",
+        message: create.networkError
+          ? create.text
+          : `Google video generation failed: ${create.status}`,
+        debug: {
+          upstreamStatus: create.status,
+          upstreamBody: truncate(create.text),
+        },
+      });
+    }
+
+    const operationName = create.payload?.name;
+    if (!operationName) {
+      return json(res, 502, {
+        success: false,
+        error: "missing_operation_name",
+        message: "Google video generation returned no operation name",
+        debug: {
+          upstreamBody: truncate(create.text),
+        },
+      });
+    }
+
+    const completedOperation = await pollGoogleOperation(operationName, apiKey);
+    const videoUri = extractGeneratedVideoUri(completedOperation);
+
+    if (!videoUri) {
+      return json(res, 502, {
+        success: false,
+        error: "missing_video_uri",
+        message: "Google video generation completed without a video URI",
+        debug: {
+          operationName,
+          operationPayload: completedOperation,
+        },
+      });
+    }
+
+    const videoResponse = await fetchWithTimeout(
+      videoUri,
+      {
+        headers: {
+          "x-goog-api-key": apiKey,
+        },
+      },
+      FETCH_TIMEOUT_MS,
+    );
+
+    if (!videoResponse.ok) {
+      return json(res, 502, {
+        success: false,
+        error: "video_download_failed",
+        message: `Failed to download generated video: ${videoResponse.status}`,
+      });
+    }
+
+    const videoBytes = Buffer.from(await videoResponse.arrayBuffer());
+    const metadata = {
+      provider: "google",
+      model,
+      relayMode: "render",
+      operationName,
+      requestedDuration: duration,
+    };
+
+    setCors(res);
+    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Proxy-Metadata", encodeMetadataHeader(metadata));
+    return res.status(200).send(videoBytes);
+  } catch (error) {
+    return json(res, 502, {
+      success: false,
+      error: "google_video_failed",
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
 });
 
 app.all("/clip", async (req, res) => {
@@ -151,7 +987,7 @@ app.all("/clip", async (req, res) => {
   }
 
   const params = parseClipParams(req);
-  const invalid = validateParams(params);
+  const invalid = validateClipParams(params);
   if (invalid) {
     return res.status(400).json({ error: invalid });
   }
@@ -168,7 +1004,7 @@ app.all("/clip", async (req, res) => {
       inputFile,
       outputFile,
       start: params.start,
-      end: params.end
+      end: params.end,
     });
     const output = await fs.readFile(outputFile);
     res.setHeader("Content-Type", "video/mp4");
@@ -183,5 +1019,5 @@ app.all("/clip", async (req, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`ffmpeg clip api listening on :${PORT}`);
+  console.log(`render relay api listening on :${PORT}`);
 });
