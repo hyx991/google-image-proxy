@@ -1,4 +1,5 @@
 import express from "express";
+import { GoogleGenAI } from "@google/genai";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -380,11 +381,12 @@ async function fetchImageInlineData(imageUrl) {
   };
 }
 
-function toGoogleImagePayload(imageInput) {
-  return {
-    imageBytes: imageInput.data,
-    mimeType: imageInput.mimeType,
-  };
+function normalizeRequestedVideoDuration(duration) {
+  const parsed = Number(duration);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return undefined;
+  }
+  return Math.round(parsed);
 }
 
 async function pollGoogleOperation(operationName, apiKey) {
@@ -420,6 +422,65 @@ async function pollGoogleOperation(operationName, apiKey) {
   }
 
   throw new Error("Google video generation timed out.");
+}
+
+async function generateVideoWithSdk({
+  apiKey,
+  prompt,
+  imageUrl,
+  model,
+  duration,
+}) {
+  const imageInput = await fetchImageInlineData(imageUrl);
+  const ai = new GoogleGenAI({ apiKey });
+  const config = {
+    numberOfVideos: 1,
+    aspectRatio: "16:9",
+  };
+  const durationSeconds = normalizeRequestedVideoDuration(duration);
+
+  if (durationSeconds) {
+    config.durationSeconds = durationSeconds;
+  }
+
+  let operation = await ai.models.generateVideos({
+    model,
+    prompt,
+    image: {
+      imageBytes: imageInput.data,
+      mimeType: imageInput.mimeType,
+    },
+    config,
+  });
+
+  while (!operation.done) {
+    await sleep(GOOGLE_POLL_MS);
+    operation = await ai.operations.getVideosOperation({ operation });
+  }
+
+  if (operation.error) {
+    throw new Error(JSON.stringify(operation.error));
+  }
+
+  const generatedVideo = operation.response?.generatedVideos?.[0]?.video;
+  if (!generatedVideo) {
+    throw new Error("Google video generation completed without a downloadable video.");
+  }
+
+  const downloadPath = path.join(os.tmpdir(), `veo-${crypto.randomUUID()}.mp4`);
+  try {
+    await ai.files.download({
+      file: generatedVideo,
+      downloadPath,
+    });
+
+    return {
+      videoBytes: await fs.readFile(downloadPath),
+      operationName: operation.name ?? null,
+    };
+  } finally {
+    await fs.rm(downloadPath, { force: true });
+  }
 }
 
 function extractGeneratedVideoUri(operationPayload) {
@@ -739,94 +800,20 @@ app.post("/google/video", async (req, res) => {
   }
 
   try {
-    const imageInput = await fetchImageInlineData(imageUrl);
-    const create = await callGoogleJson(
-      `${GOOGLE_API_BASE}/models/${encodeURIComponent(model)}:predictLongRunning`,
-      {
-        apiKey,
-        method: "POST",
-        timeoutMs: FETCH_TIMEOUT_MS,
-        body: {
-          instances: [
-            {
-              prompt,
-              image: toGoogleImagePayload(imageInput),
-            },
-          ],
-          parameters: {
-            aspectRatio: "16:9",
-          },
-        },
-      },
-    );
-
-    if (!create.ok) {
-      return json(res, create.networkError === "timeout" ? 504 : 502, {
-        success: false,
-        error: create.networkError || "google_video_create_failed",
-        message: create.networkError
-          ? create.text
-          : `Google video generation failed: ${create.status}`,
-        debug: {
-          upstreamStatus: create.status,
-          upstreamBody: truncate(create.text),
-        },
-      });
-    }
-
-    const operationName = create.payload?.name;
-    if (!operationName) {
-      return json(res, 502, {
-        success: false,
-        error: "missing_operation_name",
-        message: "Google video generation returned no operation name",
-        debug: {
-          upstreamBody: truncate(create.text),
-        },
-      });
-    }
-
-    const completedOperation = await pollGoogleOperation(operationName, apiKey);
-    const videoUri = extractGeneratedVideoUri(completedOperation);
-
-    if (!videoUri) {
-      return json(res, 502, {
-        success: false,
-        error: "missing_video_uri",
-        message: "Google video generation completed without a video URI",
-        debug: {
-          operationName,
-          operationPayload: completedOperation,
-        },
-      });
-    }
-
-    const videoResponse = await fetchWithTimeout(
-      videoUri,
-      {
-        headers: {
-          "x-goog-api-key": apiKey,
-        },
-      },
-      FETCH_TIMEOUT_MS,
-    );
-
-    if (!videoResponse.ok) {
-      return json(res, 502, {
-        success: false,
-        error: "video_download_failed",
-        message: `Failed to download generated video: ${videoResponse.status}`,
-      });
-    }
-
-    const videoBytes = Buffer.from(await videoResponse.arrayBuffer());
+    const { videoBytes, operationName } = await generateVideoWithSdk({
+      apiKey,
+      prompt,
+      imageUrl,
+      model,
+      duration,
+    });
 
     return json(res, 200, {
       success: true,
       provider: "google",
       model,
       mimeType: "video/mp4",
-      data: videoBytes.toString("base64"),
+      data: Buffer.from(videoBytes).toString("base64"),
       metadata: {
         provider: "google",
         model,
@@ -880,87 +867,13 @@ app.post("/google/video-binary", async (req, res) => {
   }
 
   try {
-    const imageInput = await fetchImageInlineData(imageUrl);
-    const create = await callGoogleJson(
-      `${GOOGLE_API_BASE}/models/${encodeURIComponent(model)}:predictLongRunning`,
-      {
-        apiKey,
-        method: "POST",
-        timeoutMs: FETCH_TIMEOUT_MS,
-        body: {
-          instances: [
-            {
-              prompt,
-              image: toGoogleImagePayload(imageInput),
-            },
-          ],
-          parameters: {
-            aspectRatio: "16:9",
-          },
-        },
-      },
-    );
-
-    if (!create.ok) {
-      return json(res, create.networkError === "timeout" ? 504 : 502, {
-        success: false,
-        error: create.networkError || "google_video_create_failed",
-        message: create.networkError
-          ? create.text
-          : `Google video generation failed: ${create.status}`,
-        debug: {
-          upstreamStatus: create.status,
-          upstreamBody: truncate(create.text),
-        },
-      });
-    }
-
-    const operationName = create.payload?.name;
-    if (!operationName) {
-      return json(res, 502, {
-        success: false,
-        error: "missing_operation_name",
-        message: "Google video generation returned no operation name",
-        debug: {
-          upstreamBody: truncate(create.text),
-        },
-      });
-    }
-
-    const completedOperation = await pollGoogleOperation(operationName, apiKey);
-    const videoUri = extractGeneratedVideoUri(completedOperation);
-
-    if (!videoUri) {
-      return json(res, 502, {
-        success: false,
-        error: "missing_video_uri",
-        message: "Google video generation completed without a video URI",
-        debug: {
-          operationName,
-          operationPayload: completedOperation,
-        },
-      });
-    }
-
-    const videoResponse = await fetchWithTimeout(
-      videoUri,
-      {
-        headers: {
-          "x-goog-api-key": apiKey,
-        },
-      },
-      FETCH_TIMEOUT_MS,
-    );
-
-    if (!videoResponse.ok) {
-      return json(res, 502, {
-        success: false,
-        error: "video_download_failed",
-        message: `Failed to download generated video: ${videoResponse.status}`,
-      });
-    }
-
-    const videoBytes = Buffer.from(await videoResponse.arrayBuffer());
+    const { videoBytes, operationName } = await generateVideoWithSdk({
+      apiKey,
+      prompt,
+      imageUrl,
+      model,
+      duration,
+    });
     const metadata = {
       provider: "google",
       model,
@@ -1024,3 +937,7 @@ app.all("/clip", async (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`render relay api listening on :${PORT}`);
 });
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
