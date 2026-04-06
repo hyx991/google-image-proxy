@@ -380,6 +380,13 @@ async function fetchImageInlineData(imageUrl) {
   };
 }
 
+function toGoogleImagePayload(imageInput) {
+  return {
+    imageBytes: imageInput.data,
+    mimeType: imageInput.mimeType,
+  };
+}
+
 async function pollGoogleOperation(operationName, apiKey) {
   const deadline = Date.now() + GOOGLE_VIDEO_TIMEOUT_MS;
 
@@ -743,9 +750,7 @@ app.post("/google/video", async (req, res) => {
           instances: [
             {
               prompt,
-              image: {
-                inlineData: imageInput,
-              },
+              image: toGoogleImagePayload(imageInput),
             },
           ],
           parameters: {
@@ -886,9 +891,7 @@ app.post("/google/video-binary", async (req, res) => {
           instances: [
             {
               prompt,
-              image: {
-                inlineData: imageInput,
-              },
+              image: toGoogleImagePayload(imageInput),
             },
           ],
           parameters: {
