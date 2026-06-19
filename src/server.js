@@ -25,6 +25,7 @@ const DEFAULT_TEXT_MODEL =
 const GOOGLE_IMAGE_TIMEOUT_MS = Number(process.env.GOOGLE_IMAGE_TIMEOUT_MS || 180000);
 const GOOGLE_TEXT_TIMEOUT_MS = Number(process.env.GOOGLE_TEXT_TIMEOUT_MS || 180000);
 const GOOGLE_VIDEO_TIMEOUT_MS = Number(process.env.GOOGLE_VIDEO_TIMEOUT_MS || 900000);
+const GOOGLE_FILE_WAIT_TIMEOUT_MS = Number(process.env.GOOGLE_FILE_WAIT_TIMEOUT_MS || 240000);
 const GOOGLE_POLL_MS = Number(process.env.GOOGLE_POLL_MS || 10000);
 const RELAY_AUTH_TOKEN = String(process.env.RELAY_AUTH_TOKEN || "").trim();
 const CJK_RE =
@@ -71,6 +72,10 @@ function normalizeVideoModel(model) {
     return "veo-3.1-generate-preview";
   }
   return model;
+}
+
+function normalizeVideoUnderstandModel(model) {
+  return String(model || DEFAULT_TEXT_MODEL).trim() || DEFAULT_TEXT_MODEL;
 }
 
 function resolveGoogleApiKey(req) {
@@ -441,6 +446,64 @@ async function fetchImageInlineData(imageUrl) {
   };
 }
 
+async function fetchVideoInlineData(videoUrl) {
+  const response = await fetchWithTimeout(videoUrl, {}, FETCH_TIMEOUT_MS);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch source video: ${response.status} ${response.statusText}`);
+  }
+
+  const mimeType = response.headers.get("content-type")?.split(";")[0] || "video/mp4";
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (!bytes.byteLength) {
+    throw new Error("Source video is empty");
+  }
+  if (bytes.byteLength > MAX_INPUT_BYTES) {
+    throw new Error(`Source video is too large: ${bytes.byteLength} bytes`);
+  }
+
+  return {
+    mimeType,
+    bytes,
+  };
+}
+
+function buildVideoUnderstandPrompt(prompt) {
+  const userPrompt = String(prompt || "").trim();
+  if (userPrompt) {
+    return userPrompt;
+  }
+
+  return [
+    "你是短视频内容分析师。请理解这个视频，并输出结构化中文分析。",
+    "请包含：",
+    "1. 视频主题",
+    "2. 画面/分镜摘要",
+    "3. 可能的口播或字幕重点",
+    "4. 爆点与情绪钩子",
+    "5. 可复用脚本结构",
+    "6. 适合本地门店老板改编的拍摄建议",
+  ].join("\n");
+}
+
+async function waitForGoogleFileReady(ai, file) {
+  const deadline = Date.now() + GOOGLE_FILE_WAIT_TIMEOUT_MS;
+  let current = file;
+
+  while (Date.now() < deadline) {
+    if (current?.state === "ACTIVE" || current?.state === "SUCCEEDED") {
+      return current;
+    }
+    if (current?.state === "FAILED") {
+      throw new Error("Google file processing failed");
+    }
+
+    await sleep(GOOGLE_POLL_MS);
+    current = await ai.files.get({ name: current.name });
+  }
+
+  throw new Error("Google file processing timed out");
+}
+
 function normalizeRequestedVideoDuration(duration) {
   const parsed = Number(duration);
   if (!Number.isFinite(parsed) || parsed <= 0) {
@@ -567,6 +630,7 @@ app.get("/", (req, res) => {
       "/clip",
       "/google/models",
       "/google/text",
+      "/google/video-understand",
       "/v1/chat/completions",
       "/google/image",
       "/google/image-binary",
@@ -759,6 +823,91 @@ app.post("/v1/chat/completions", async (req, res) => {
     ],
     usage: response.payload?.usageMetadata || undefined,
   });
+});
+
+app.post("/google/video-understand", async (req, res) => {
+  if (!ensureRelayAuthorized(req, res)) {
+    return;
+  }
+
+  const apiKey = resolveGoogleApiKey(req);
+  if (!apiKey) {
+    return json(res, 400, {
+      success: false,
+      error: "missing_google_api_key",
+      message: "Provide x-goog-api-key or configure GOOGLE_API_KEY",
+    });
+  }
+
+  const videoUrl = String(req.body?.videoUrl || req.body?.url || "").trim();
+  const prompt = buildVideoUnderstandPrompt(req.body?.prompt);
+  const model = normalizeVideoUnderstandModel(req.body?.model);
+  if (!videoUrl) {
+    return json(res, 400, {
+      success: false,
+      error: "missing_video_url",
+      message: "Provide videoUrl",
+    });
+  }
+
+  try {
+    const ai = new GoogleGenAI({ apiKey });
+    const video = await fetchVideoInlineData(videoUrl);
+    const file = await ai.files.upload({
+      file: new Blob([video.bytes], { type: video.mimeType }),
+      config: {
+        mimeType: video.mimeType,
+        displayName: `video-${Date.now()}`,
+      },
+    });
+    const readyFile = await waitForGoogleFileReady(ai, file);
+    const result = await ai.models.generateContent({
+      model,
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              fileData: {
+                mimeType: readyFile.mimeType || video.mimeType,
+                fileUri: readyFile.uri,
+              },
+            },
+            { text: prompt },
+          ],
+        },
+      ],
+    });
+
+    const text = extractTextParts(result).join("\n").trim() || String(result.text || "").trim();
+    return json(res, 200, {
+      success: true,
+      ok: true,
+      mode: "live",
+      source: "gemini_files_video_understand",
+      provider: "google",
+      model,
+      text,
+      result: text,
+      file: {
+        name: readyFile.name,
+        uri: readyFile.uri,
+        mimeType: readyFile.mimeType || video.mimeType,
+        state: readyFile.state,
+      },
+      usage: result?.usageMetadata || null,
+    });
+  } catch (error) {
+    return json(res, 502, {
+      success: false,
+      ok: false,
+      mode: "failed",
+      source: "gemini_files_video_understand",
+      error: "google_video_understand_failed",
+      message: error instanceof Error ? error.message : String(error),
+      detail: truncate(error?.stack || error),
+    });
+  }
 });
 
 app.post("/google/image", async (req, res) => {
