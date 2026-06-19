@@ -446,8 +446,28 @@ async function fetchImageInlineData(imageUrl) {
   };
 }
 
-async function fetchVideoInlineData(videoUrl) {
-  const response = await fetchWithTimeout(videoUrl, {}, FETCH_TIMEOUT_MS);
+function buildVideoFetchHeaders(videoUrl, extraHeaders = {}) {
+  const headers = {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    Accept: "video/mp4,video/*,*/*",
+    Referer: /douyin\.com|douyinvod\.com|byteimg\.com/i.test(String(videoUrl || ""))
+      ? "https://www.douyin.com/"
+      : undefined,
+    ...extraHeaders,
+  };
+  return Object.fromEntries(Object.entries(headers).filter(([, value]) => value));
+}
+
+async function fetchVideoInlineData(videoUrl, options = {}) {
+  const response = await fetchWithTimeout(
+    videoUrl,
+    {
+      headers: buildVideoFetchHeaders(videoUrl, options.headers),
+    },
+    FETCH_TIMEOUT_MS,
+  );
   if (!response.ok) {
     throw new Error(`Failed to fetch source video: ${response.status} ${response.statusText}`);
   }
@@ -852,7 +872,11 @@ app.post("/google/video-understand", async (req, res) => {
 
   try {
     const ai = new GoogleGenAI({ apiKey });
-    const video = await fetchVideoInlineData(videoUrl);
+    const video = await fetchVideoInlineData(videoUrl, {
+      headers: req.body?.videoHeaders && typeof req.body.videoHeaders === "object"
+        ? req.body.videoHeaders
+        : {},
+    });
     const file = await ai.files.upload({
       file: new Blob([video.bytes], { type: video.mimeType }),
       config: {
