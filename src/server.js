@@ -20,7 +20,10 @@ const DEFAULT_VIDEO_MODEL =
   process.env.VIDEO_MODEL || "veo-3.1-generate-preview";
 const DEFAULT_TRANSLATION_MODEL =
   process.env.TRANSLATION_MODEL || "gemini-2.5-flash";
+const DEFAULT_TEXT_MODEL =
+  process.env.TEXT_MODEL || "gemini-3.1-flash-lite";
 const GOOGLE_IMAGE_TIMEOUT_MS = Number(process.env.GOOGLE_IMAGE_TIMEOUT_MS || 180000);
+const GOOGLE_TEXT_TIMEOUT_MS = Number(process.env.GOOGLE_TEXT_TIMEOUT_MS || 180000);
 const GOOGLE_VIDEO_TIMEOUT_MS = Number(process.env.GOOGLE_VIDEO_TIMEOUT_MS || 900000);
 const GOOGLE_POLL_MS = Number(process.env.GOOGLE_POLL_MS || 10000);
 const RELAY_AUTH_TOKEN = String(process.env.RELAY_AUTH_TOKEN || "").trim();
@@ -304,6 +307,63 @@ function extractTextParts(payload) {
   return texts;
 }
 
+function normalizeTextModel(model) {
+  return String(model || DEFAULT_TEXT_MODEL).trim() || DEFAULT_TEXT_MODEL;
+}
+
+function messagesToPrompt(messages) {
+  if (!Array.isArray(messages)) {
+    return "";
+  }
+
+  return messages
+    .map((message) => {
+      const role = String(message?.role || "user").trim();
+      const content = message?.content;
+
+      if (typeof content === "string") {
+        return `${role}: ${content}`;
+      }
+
+      if (Array.isArray(content)) {
+        const text = content
+          .map((part) => {
+            if (typeof part === "string") {
+              return part;
+            }
+            if (typeof part?.text === "string") {
+              return part.text;
+            }
+            return "";
+          })
+          .filter(Boolean)
+          .join("\n");
+        return text ? `${role}: ${text}` : "";
+      }
+
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function buildTextPayload({ prompt, messages, temperature, maxOutputTokens }) {
+  const text = String(prompt || "").trim() || messagesToPrompt(messages).trim();
+  if (!text) {
+    return null;
+  }
+
+  return {
+    contents: [{ parts: [{ text }] }],
+    generationConfig: {
+      temperature: Number.isFinite(Number(temperature)) ? Number(temperature) : 0.7,
+      maxOutputTokens: Number.isFinite(Number(maxOutputTokens))
+        ? Number(maxOutputTokens)
+        : 2048,
+    },
+  };
+}
+
 async function maybeRewritePrompt(prompt, apiKey) {
   if (!CJK_RE.test(prompt)) {
     return {
@@ -506,6 +566,8 @@ app.get("/", (req, res) => {
       "/health",
       "/clip",
       "/google/models",
+      "/google/text",
+      "/v1/chat/completions",
       "/google/image",
       "/google/image-binary",
       "/google/video",
@@ -560,6 +622,143 @@ app.get("/google/models", async (req, res) => {
   }
 
   return json(res, 200, response.payload || {});
+});
+
+app.post("/google/text", async (req, res) => {
+  if (!ensureRelayAuthorized(req, res)) {
+    return;
+  }
+
+  const apiKey = resolveGoogleApiKey(req);
+  if (!apiKey) {
+    return json(res, 400, {
+      success: false,
+      error: "missing_google_api_key",
+      message: "Provide x-goog-api-key or configure GOOGLE_API_KEY",
+    });
+  }
+
+  const model = normalizeTextModel(req.body?.model);
+  const payload = buildTextPayload({
+    prompt: req.body?.prompt,
+    messages: req.body?.messages,
+    temperature: req.body?.temperature,
+    maxOutputTokens: req.body?.maxOutputTokens || req.body?.max_tokens,
+  });
+
+  if (!payload) {
+    return json(res, 400, {
+      success: false,
+      error: "missing_prompt",
+      message: "Provide prompt or messages",
+    });
+  }
+
+  const response = await callGoogleJson(
+    `${GOOGLE_API_BASE}/models/${encodeURIComponent(model)}:generateContent`,
+    {
+      apiKey,
+      method: "POST",
+      timeoutMs: GOOGLE_TEXT_TIMEOUT_MS,
+      body: payload,
+    },
+  );
+
+  if (!response.ok) {
+    return json(res, response.networkError === "timeout" ? 504 : 502, {
+      success: false,
+      error: response.networkError || "google_text_failed",
+      message: response.networkError
+        ? response.text
+        : `Google text generation failed: ${response.status}`,
+      debug: {
+        upstreamStatus: response.status,
+        upstreamBody: truncate(response.text),
+      },
+    });
+  }
+
+  const text = extractTextParts(response.payload).join("\n").trim();
+  return json(res, 200, {
+    success: true,
+    provider: "google",
+    model,
+    text,
+    result: text,
+    raw: response.payload,
+  });
+});
+
+app.post("/v1/chat/completions", async (req, res) => {
+  if (!ensureRelayAuthorized(req, res)) {
+    return;
+  }
+
+  const apiKey = resolveGoogleApiKey(req);
+  if (!apiKey) {
+    return json(res, 400, {
+      error: {
+        message: "Provide x-goog-api-key or configure GOOGLE_API_KEY",
+        type: "missing_google_api_key",
+      },
+    });
+  }
+
+  const model = normalizeTextModel(req.body?.model);
+  const payload = buildTextPayload({
+    messages: req.body?.messages,
+    temperature: req.body?.temperature,
+    maxOutputTokens: req.body?.max_tokens,
+  });
+
+  if (!payload) {
+    return json(res, 400, {
+      error: {
+        message: "Provide messages",
+        type: "missing_messages",
+      },
+    });
+  }
+
+  const response = await callGoogleJson(
+    `${GOOGLE_API_BASE}/models/${encodeURIComponent(model)}:generateContent`,
+    {
+      apiKey,
+      method: "POST",
+      timeoutMs: GOOGLE_TEXT_TIMEOUT_MS,
+      body: payload,
+    },
+  );
+
+  if (!response.ok) {
+    return json(res, response.networkError === "timeout" ? 504 : 502, {
+      error: {
+        message: response.networkError
+          ? response.text
+          : `Google text generation failed: ${response.status}`,
+        type: response.networkError || "google_text_failed",
+      },
+    });
+  }
+
+  const text = extractTextParts(response.payload).join("\n").trim();
+  return json(res, 200, {
+    id: `chatcmpl-${crypto.randomUUID()}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [
+      {
+        index: 0,
+        finish_reason: "stop",
+        message: {
+          role: "assistant",
+          content: text,
+        },
+      },
+    ],
+    usage: response.payload?.usageMetadata || undefined,
+  });
 });
 
 app.post("/google/image", async (req, res) => {
